@@ -515,8 +515,6 @@ class NativeMacCursor:
     def set_custom(self) -> None:
         if not self.available or self.cursor is None:
             return
-        if self.active:
-            return
         try:
             self._send_void(self.cursor, "set")
             self.active = True
@@ -592,12 +590,16 @@ class NativeMacCursor:
 class CursorManager:
     """Applies one visible cursor policy across every game window."""
 
+    POLL_MS = 25
+
     def __init__(self, root: tk.Tk, image_path: Path) -> None:
         self.root = root
         self.native_cursor = NativeMacCursor(image_path)
         self.cursor_value = "arrow"
         self.windows: set[tk.Toplevel | tk.Tk] = {root}
         self.configured_widgets: set[str] = set()
+        self.poll_after_id: str | None = None
+        self.refresh_after_id: str | None = None
         self.root.bind("<Destroy>", self._on_destroy, add="+")
 
     def attach(self, widget: tk.Widget) -> None:
@@ -610,6 +612,7 @@ class CursorManager:
         window.bind("<Motion>", self._activate, add="+")
         window.bind("<Leave>", lambda _event: self._reset_if_outside(), add="+")
         window.bind("<Destroy>", self._on_destroy, add="+")
+        self.start()
 
     def unregister_window(self, window: tk.Toplevel | tk.Tk) -> None:
         self.windows.discard(window)
@@ -628,6 +631,7 @@ class CursorManager:
 
         widget.bind("<Enter>", self._activate, add="+")
         widget.bind("<Motion>", self._activate, add="+")
+        widget.bind("<Leave>", lambda _event: self._reset_if_outside(), add="+")
         widget.bind("<Map>", lambda event: self.apply_cursor(event.widget), add="+")
         for child in widget.winfo_children():
             self.apply_cursor(child)
@@ -635,19 +639,54 @@ class CursorManager:
     def redraw(self, _canvas: tk.Canvas) -> None:
         self._activate()
 
+    def start(self) -> None:
+        if self.poll_after_id is None:
+            self._poll_pointer()
+
     def stop(self) -> None:
+        if self.poll_after_id is not None:
+            try:
+                self.root.after_cancel(self.poll_after_id)
+            except tk.TclError:
+                pass
+            self.poll_after_id = None
+        if self.refresh_after_id is not None:
+            try:
+                self.root.after_cancel(self.refresh_after_id)
+            except tk.TclError:
+                pass
+            self.refresh_after_id = None
         self.native_cursor.set_arrow()
 
     def _activate(self, _event: tk.Event[tk.Widget] | None = None) -> None:
-        self.native_cursor.set_custom()
+        if self.refresh_after_id is not None:
+            return
+        try:
+            self.refresh_after_id = self.root.after_idle(self._apply_current_pointer)
+        except tk.TclError:
+            self.refresh_after_id = None
 
     def _reset_if_outside(self) -> None:
+        self._apply_current_pointer()
+
+    def _poll_pointer(self) -> None:
+        self._apply_current_pointer()
+        try:
+            self.poll_after_id = self.root.after(self.POLL_MS, self._poll_pointer)
+        except tk.TclError:
+            self.poll_after_id = None
+
+    def _apply_current_pointer(self) -> None:
+        self.refresh_after_id = None
         try:
             x = self.root.winfo_pointerx()
             y = self.root.winfo_pointery()
         except tk.TclError:
             return
-        if not self._pointer_inside_app(x, y):
+
+        if self._pointer_inside_app(x, y):
+            self.native_cursor.set_custom()
+        else:
             self.native_cursor.set_arrow()
 
     def _pointer_inside_app(self, x: int, y: int) -> bool:
@@ -701,6 +740,7 @@ class PegSolitaireApp:
         self.animation_move: Move | None = None
         self.animation_position: tuple[float, float, float] | None = None
         self.removed_peg_animation_position: tuple[float, float, float] | None = None
+        self.removed_peg_lift_progress = 0.0
         self.animation_hidden_indexes: set[int] = set()
         self.animation_after_id: str | None = None
         self.session_score = 0
@@ -1078,6 +1118,7 @@ class PegSolitaireApp:
         self.animation_move = None
         self.animation_position = None
         self.removed_peg_animation_position = None
+        self.removed_peg_lift_progress = 0.0
         self.animation_hidden_indexes.clear()
         self.is_animating = False
         self.sound.play("slot")
@@ -1105,6 +1146,7 @@ class PegSolitaireApp:
         self.animation_hidden_indexes = {move.start, move.over}
         self.animation_position = (start_x, start_y, radius)
         self.removed_peg_animation_position = (over_x, over_y, over_radius)
+        self.removed_peg_lift_progress = 0.0
         self.status_var.set(
             f"Moving peg {move.start} over {move.over} into hole {move.end}..."
         )
@@ -1114,7 +1156,7 @@ class PegSolitaireApp:
         if not self.is_animating or self.animation_move != move:
             return
 
-        total_frames = 18
+        total_frames = 22
         start_x, start_y, radius = self.hole_positions[move.start]
         end_x, end_y, _radius = self.hole_positions[move.end]
         over_x, over_y, over_radius = self.hole_positions[move.over]
@@ -1127,24 +1169,21 @@ class PegSolitaireApp:
         scale = 1.08 + (math.sin(math.pi * progress) * 0.18) - (slot_drop * 0.08)
         self.animation_position = (x, y, radius * scale)
 
-        remove_progress = min(1.0, progress / 0.92)
+        remove_progress = min(1.0, progress / 0.96)
         remove_eased = 1.0 - ((1.0 - remove_progress) ** 3)
-        remove_wobble = (
-            math.sin(remove_progress * math.pi * 5)
-            * over_radius
-            * 0.055
-            * (1.0 - remove_progress)
-        )
-        remove_lift = remove_eased * over_radius * 2.25
-        remove_scale = max(
-            0.0,
-            1.04 + (math.sin(remove_progress * math.pi) * 0.24) - remove_progress,
-        )
+        remove_lift = remove_eased * over_radius * 4.15
+        if remove_progress < 0.72:
+            remove_scale = 1.03 + (math.sin(remove_progress * math.pi) * 0.14)
+        else:
+            vanish_progress = (remove_progress - 0.72) / 0.28
+            remove_scale = max(0.0, 1.05 * ((1.0 - vanish_progress) ** 2.0))
+
+        self.removed_peg_lift_progress = remove_progress
         if remove_scale <= 0.08:
             self.removed_peg_animation_position = None
         else:
             self.removed_peg_animation_position = (
-                over_x + remove_wobble,
+                over_x,
                 over_y - remove_lift,
                 over_radius * remove_scale,
             )
@@ -1201,6 +1240,7 @@ class PegSolitaireApp:
         self.animation_move = None
         self.animation_position = None
         self.removed_peg_animation_position = None
+        self.removed_peg_lift_progress = 0.0
         self.animation_hidden_indexes.clear()
         self.is_animating = False
         self.status_var.set(
@@ -1220,6 +1260,7 @@ class PegSolitaireApp:
         self.animation_move = None
         self.animation_position = None
         self.removed_peg_animation_position = None
+        self.removed_peg_lift_progress = 0.0
         self.animation_hidden_indexes.clear()
         self.is_animating = False
 
@@ -1595,22 +1636,24 @@ class PegSolitaireApp:
         hinted: bool,
         hovered: bool = False,
         lifted: bool = False,
+        draw_shadow: bool = True,
         tags: str | tuple[str, ...] = (),
     ) -> None:
         peg_radius = radius * 0.92
         shadow_width = 1.32 if lifted else 1.08
         shadow_height = 0.68 if lifted else 0.46
         shadow_y = y + peg_radius * (0.58 if lifted else 0.48)
-        self.canvas.create_oval(
-            x - peg_radius * shadow_width,
-            shadow_y - peg_radius * shadow_height,
-            x + peg_radius * shadow_width,
-            shadow_y + peg_radius * shadow_height,
-            fill="#1d120a",
-            outline="",
-            stipple="gray50",
-            tags=tags,
-        )
+        if draw_shadow:
+            self.canvas.create_oval(
+                x - peg_radius * shadow_width,
+                shadow_y - peg_radius * shadow_height,
+                x + peg_radius * shadow_width,
+                shadow_y + peg_radius * shadow_height,
+                fill="#1d120a",
+                outline="",
+                stipple="gray50",
+                tags=tags,
+            )
         self.canvas.create_oval(
             x - peg_radius * 0.98,
             y - peg_radius * 0.88,
@@ -1677,6 +1720,14 @@ class PegSolitaireApp:
     def _draw_animation_pegs(self) -> None:
         if self.removed_peg_animation_position is not None:
             x, y, radius = self.removed_peg_animation_position
+            if self.animation_move is not None:
+                over_x, over_y, over_radius = self.hole_positions[self.animation_move.over]
+                self._draw_lift_shadow(
+                    over_x,
+                    over_y,
+                    over_radius,
+                    self.removed_peg_lift_progress,
+                )
             self._draw_white_peg(
                 x,
                 y,
@@ -1685,6 +1736,7 @@ class PegSolitaireApp:
                 hinted=False,
                 hovered=False,
                 lifted=True,
+                draw_shadow=False,
                 tags="removed_peg_animation",
             )
 
@@ -1701,6 +1753,30 @@ class PegSolitaireApp:
             hovered=False,
             lifted=True,
             tags="animation_peg",
+        )
+
+    def _draw_lift_shadow(
+        self,
+        x: float,
+        y: float,
+        radius: float,
+        progress: float,
+    ) -> None:
+        peg_radius = radius * 0.92
+        shadow_scale = max(0.22, 1.0 - (progress * 0.72))
+        shadow_width = 1.08 * shadow_scale
+        shadow_height = 0.46 * shadow_scale
+        shadow_y = y + peg_radius * 0.48
+        stipple = "gray50" if progress < 0.58 else "gray25"
+        self.canvas.create_oval(
+            x - peg_radius * shadow_width,
+            shadow_y - peg_radius * shadow_height,
+            x + peg_radius * shadow_width,
+            shadow_y + peg_radius * shadow_height,
+            fill="#1d120a",
+            outline="",
+            stipple=stipple,
+            tags="removed_peg_shadow",
         )
 
     def _hole_at(self, x: float, y: float) -> int | None:
