@@ -23,6 +23,16 @@ from .game import (
     TrianglePegSolitaire,
     score_board,
 )
+from .storage import (
+    ANIMATION_SPEEDS,
+    CURSOR_MODES,
+    DEFAULT_STATS_PATH,
+    GameStats,
+    StatsUpdate,
+    load_stats,
+    record_game,
+    save_stats,
+)
 
 
 ASSET_DIR = Path(__file__).resolve().parent.parent / "assets"
@@ -591,11 +601,13 @@ class CursorManager:
     """Applies one visible cursor policy across every game window."""
 
     POLL_MS = 25
+    TITLEBAR_GUARD_PX = 48
 
     def __init__(self, root: tk.Tk, image_path: Path) -> None:
         self.root = root
         self.native_cursor = NativeMacCursor(image_path)
         self.cursor_value = "arrow"
+        self.mode = "auto"
         self.windows: set[tk.Toplevel | tk.Tk] = {root}
         self.configured_widgets: set[str] = set()
         self.poll_after_id: str | None = None
@@ -639,6 +651,13 @@ class CursorManager:
     def redraw(self, _canvas: tk.Canvas) -> None:
         self._activate()
 
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode if mode in CURSOR_MODES else "auto"
+        if self.mode == "system":
+            self.native_cursor.set_arrow()
+        else:
+            self._activate()
+
     def start(self) -> None:
         if self.poll_after_id is None:
             self._poll_pointer()
@@ -678,16 +697,57 @@ class CursorManager:
 
     def _apply_current_pointer(self) -> None:
         self.refresh_after_id = None
+        if self.mode == "system":
+            self.native_cursor.set_arrow()
+            return
         try:
             x = self.root.winfo_pointerx()
             y = self.root.winfo_pointery()
         except tk.TclError:
             return
 
-        if self._pointer_inside_app(x, y):
+        if self._pointer_inside_app_content(x, y):
             self.native_cursor.set_custom()
         else:
             self.native_cursor.set_arrow()
+
+    def _pointer_inside_app_content(self, x: int, y: int) -> bool:
+        try:
+            widget = self.root.winfo_containing(x, y)
+        except tk.TclError:
+            return False
+
+        if widget is None:
+            return False
+        if not self._widget_belongs_to_registered_window(widget):
+            return False
+
+        return not self._inside_titlebar_guard(widget.winfo_toplevel(), x, y)
+
+    def _widget_belongs_to_registered_window(self, widget: tk.Widget) -> bool:
+        current: tk.Widget | None = widget
+        while current is not None:
+            if current in self.windows:
+                return True
+            try:
+                parent_name = current.winfo_parent()
+                if not parent_name:
+                    return False
+                current = current.nametowidget(parent_name)
+            except (KeyError, tk.TclError):
+                return False
+        return False
+
+    def _inside_titlebar_guard(self, window: tk.Toplevel | tk.Tk, x: int, y: int) -> bool:
+        try:
+            if not window.winfo_exists() or not window.winfo_viewable():
+                return False
+            top = window.winfo_rooty()
+            left = window.winfo_rootx()
+            right = left + window.winfo_width()
+        except tk.TclError:
+            return False
+        return left <= x < right and top <= y < top + self.TITLEBAR_GUARD_PX
 
     def _pointer_inside_app(self, x: int, y: int) -> bool:
         for window in list(self.windows):
@@ -719,18 +779,23 @@ class CursorManager:
 class PegSolitaireApp:
     """Desktop game interface with a wooden board and white pegs."""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, stats_path: Path = DEFAULT_STATS_PATH) -> None:
         self.root = root
         self.root.title("Triangle Peg Solitaire")
+        self.root.geometry("1280x860")
         self.root.minsize(1060, 680)
+        self.stats_path = stats_path
 
         self.rows_var = tk.IntVar(value=5)
         self.score_var = tk.StringVar(value="Score: 0")
         self.pegs_var = tk.StringVar(value="")
         self.moves_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
+        self.player_stats_var = tk.StringVar(value="")
 
         self.sound = SoundEffects()
+        self.stats: GameStats = load_stats(self.stats_path)
+        self.sound.enabled = self.stats.sound_enabled
         self.game = TrianglePegSolitaire(rows=self.rows_var.get())
         self.history: list[tuple[list[int], int | None, int | None, int]] = []
         self.selected_peg: int | None = None
@@ -750,14 +815,22 @@ class PegSolitaireApp:
         self.board_texture: tk.PhotoImage | None = None
         self.board_texture_size: tuple[int, int] | None = None
         self.game_over_window: tk.Toplevel | None = None
+        self.tutorial_window: tk.Toplevel | None = None
+        self.settings_window: tk.Toplevel | None = None
+        self.sidebar_canvas: tk.Canvas | None = None
+        self.sidebar_canvas_window: int | None = None
+        self.sidebar_scrollbar: ttk.Scrollbar | None = None
+        self.last_stats_update: StatsUpdate | None = None
         self.cursor_sprite: tk.PhotoImage | None = None
         self.table_fill = "#191d18"
 
         self._load_assets()
         self.cursor_manager = CursorManager(self.root, GAME_CURSOR)
+        self.cursor_manager.set_mode(self.stats.cursor_mode)
         self._configure_style()
         self._build_layout()
         self.new_game()
+        self.root.after(350, self._maybe_show_tutorial)
 
     def _load_assets(self) -> None:
         if WOOD_TEXTURE.exists():
@@ -821,6 +894,15 @@ class PegSolitaireApp:
             foreground=[("disabled", "#4d4238")],
         )
         style.configure("Readable.TSeparator", background="#6e5740")
+        style.configure(
+            "Sidebar.Vertical.TScrollbar",
+            background="#6e5740",
+            troughcolor="#111410",
+            bordercolor="#111410",
+            arrowcolor="#fff8ea",
+            relief="flat",
+            width=12,
+        )
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -840,10 +922,40 @@ class PegSolitaireApp:
         self.canvas.bind("<Leave>", self._on_canvas_leave)
         self.cursor_manager.attach(self.canvas)
 
-        sidebar = ttk.Frame(self.root, style="Side.TFrame", padding=32)
-        sidebar.grid(row=0, column=1, sticky="ns")
-        sidebar.grid_propagate(False)
-        sidebar.configure(width=430)
+        sidebar_outer = tk.Frame(self.root, bg="#111410", width=430, bd=0)
+        sidebar_outer.grid(row=0, column=1, sticky="ns")
+        sidebar_outer.grid_propagate(False)
+        sidebar_outer.columnconfigure(0, weight=1)
+        sidebar_outer.rowconfigure(0, weight=1)
+
+        self.sidebar_canvas = tk.Canvas(
+            sidebar_outer,
+            bg="#111410",
+            highlightthickness=0,
+            bd=0,
+            width=416,
+        )
+        self.sidebar_canvas.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_scrollbar = ttk.Scrollbar(
+            sidebar_outer,
+            orient="vertical",
+            command=self.sidebar_canvas.yview,
+            style="Sidebar.Vertical.TScrollbar",
+        )
+        self.sidebar_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_scrollbar.set)
+
+        sidebar = ttk.Frame(self.sidebar_canvas, style="Side.TFrame", padding=32)
+        self.sidebar_canvas_window = self.sidebar_canvas.create_window(
+            0,
+            0,
+            anchor="nw",
+            window=sidebar,
+        )
+        sidebar.bind("<Configure>", self._on_sidebar_configure)
+        self.sidebar_canvas.bind("<Configure>", self._on_sidebar_canvas_configure)
+        sidebar_outer.bind("<Enter>", self._bind_sidebar_scroll, add="+")
+        sidebar_outer.bind("<Leave>", self._unbind_sidebar_scroll, add="+")
         sidebar.columnconfigure(0, weight=1)
 
         ttk.Label(sidebar, text="Triangle Peg Solitaire", style="Title.TLabel").grid(
@@ -893,32 +1005,82 @@ class PegSolitaireApp:
             text="Hint",
             bg="#111410",
             command=self.show_hint,
-        ).grid(row=5, column=0, sticky="ew", pady=(0, 24))
+        ).grid(row=5, column=0, sticky="ew", pady=(0, 12))
+
+        action_row = ttk.Frame(sidebar, style="Side.TFrame")
+        action_row.grid(row=6, column=0, sticky="ew", pady=(0, 18))
+        action_row.columnconfigure(0, weight=1)
+        action_row.columnconfigure(1, weight=1)
+        self._make_button(
+            action_row,
+            text="How to Play",
+            bg="#111410",
+            command=lambda: self._show_tutorial(force=True),
+            width=160,
+            height=44,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._make_button(
+            action_row,
+            text="Settings",
+            bg="#111410",
+            command=self._show_settings,
+            width=160,
+            height=44,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         ttk.Separator(sidebar, style="Readable.TSeparator").grid(
-            row=6,
-            column=0,
-            sticky="ew",
-            pady=(0, 20),
-        )
-        ttk.Label(sidebar, textvariable=self.score_var, style="Stat.TLabel").grid(
             row=7,
             column=0,
-            sticky="w",
-            pady=(0, 10),
+            sticky="ew",
+            pady=(0, 16),
         )
-        ttk.Label(sidebar, textvariable=self.pegs_var, style="Stat.TLabel").grid(
+        ttk.Label(sidebar, textvariable=self.score_var, style="Stat.TLabel").grid(
             row=8,
             column=0,
             sticky="w",
-            pady=(0, 10),
+            pady=(0, 8),
         )
-        ttk.Label(sidebar, textvariable=self.moves_var, style="Stat.TLabel").grid(
+        ttk.Label(sidebar, textvariable=self.pegs_var, style="Stat.TLabel").grid(
             row=9,
             column=0,
             sticky="w",
-            pady=(0, 22),
+            pady=(0, 8),
         )
+        ttk.Label(sidebar, textvariable=self.moves_var, style="Stat.TLabel").grid(
+            row=10,
+            column=0,
+            sticky="w",
+            pady=(0, 14),
+        )
+
+        player_box = tk.Frame(
+            sidebar,
+            bg="#171c16",
+            highlightbackground="#6e5740",
+            highlightcolor="#6e5740",
+            highlightthickness=1,
+            bd=0,
+        )
+        player_box.grid(row=11, column=0, sticky="ew", pady=(0, 16))
+        player_box.columnconfigure(0, weight=1)
+        tk.Label(
+            player_box,
+            text="Player Stats",
+            bg="#171c16",
+            fg="#fff8ea",
+            font=("Helvetica", 12, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
+        tk.Message(
+            player_box,
+            textvariable=self.player_stats_var,
+            bg="#171c16",
+            fg="#f6e7c6",
+            font=("Helvetica", 12),
+            width=322,
+            anchor="nw",
+        ).grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self.cursor_manager.apply_cursor(player_box)
 
         status_box = tk.Frame(
             sidebar,
@@ -928,7 +1090,7 @@ class PegSolitaireApp:
             highlightthickness=2,
             bd=0,
         )
-        status_box.grid(row=10, column=0, sticky="new")
+        status_box.grid(row=12, column=0, sticky="new")
         status_box.columnconfigure(0, weight=1)
         tk.Label(
             status_box,
@@ -947,13 +1109,396 @@ class PegSolitaireApp:
             width=322,
             anchor="nw",
         ).grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 14))
-        sidebar.rowconfigure(10, weight=1)
+        self.cursor_manager.apply_cursor(status_box)
+        sidebar.rowconfigure(12, weight=1)
+        self.cursor_manager.apply_cursor(sidebar_outer)
         self.cursor_manager.register_window(self.root)
+
+    def _on_sidebar_configure(self, _event: tk.Event[ttk.Frame]) -> None:
+        if self.sidebar_canvas is None:
+            return
+        self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
+        self._sync_sidebar_scrollbar()
+
+    def _on_sidebar_canvas_configure(self, event: tk.Event[tk.Canvas]) -> None:
+        if self.sidebar_canvas is None or self.sidebar_canvas_window is None:
+            return
+        self.sidebar_canvas.itemconfigure(self.sidebar_canvas_window, width=event.width)
+        self._sync_sidebar_scrollbar()
+
+    def _sync_sidebar_scrollbar(self) -> None:
+        if self.sidebar_canvas is None or self.sidebar_scrollbar is None:
+            return
+
+        scrollregion = self.sidebar_canvas.cget("scrollregion")
+        if not scrollregion:
+            return
+        try:
+            _left, top, _right, bottom = map(float, scrollregion.split())
+        except ValueError:
+            return
+
+        content_height = bottom - top
+        canvas_height = self.sidebar_canvas.winfo_height()
+        needs_scrollbar = content_height > canvas_height + 1
+        if needs_scrollbar:
+            if not self.sidebar_scrollbar.winfo_ismapped():
+                self.sidebar_scrollbar.grid(row=0, column=1, sticky="ns")
+        else:
+            if self.sidebar_scrollbar.winfo_ismapped():
+                self.sidebar_scrollbar.grid_remove()
+            self.sidebar_canvas.yview_moveto(0.0)
+
+    def _bind_sidebar_scroll(self, _event: tk.Event[tk.Widget]) -> None:
+        if self.sidebar_canvas is None:
+            return
+        self.sidebar_canvas.bind_all("<MouseWheel>", self._on_sidebar_mousewheel)
+        self.sidebar_canvas.bind_all("<Button-4>", self._on_sidebar_mousewheel)
+        self.sidebar_canvas.bind_all("<Button-5>", self._on_sidebar_mousewheel)
+
+    def _unbind_sidebar_scroll(self, _event: tk.Event[tk.Widget]) -> None:
+        if self.sidebar_canvas is None:
+            return
+        self.sidebar_canvas.unbind_all("<MouseWheel>")
+        self.sidebar_canvas.unbind_all("<Button-4>")
+        self.sidebar_canvas.unbind_all("<Button-5>")
+
+    def _on_sidebar_mousewheel(self, event: tk.Event[tk.Widget]) -> str:
+        if self.sidebar_canvas is None:
+            return "break"
+        if getattr(event, "num", None) == 4:
+            units = -3
+        elif getattr(event, "num", None) == 5:
+            units = 3
+        else:
+            delta = getattr(event, "delta", 0)
+            units = -3 if delta > 0 else 3
+        self.sidebar_canvas.yview_scroll(units, "units")
+        return "break"
 
     def _make_button(self, parent: tk.Misc, **kwargs) -> FriendlyButton:
         button = FriendlyButton(parent, **kwargs)
         self.cursor_manager.attach(button)
         return button
+
+    def _save_stats(self) -> None:
+        try:
+            save_stats(self.stats, self.stats_path)
+        except OSError:
+            self.status_var.set(
+                "Stats could not be saved. The board is keeping a dramatic secret."
+            )
+
+    def _refresh_player_stats(self) -> None:
+        fewest = (
+            str(self.stats.fewest_pegs_remaining)
+            if self.stats.fewest_pegs_remaining is not None
+            else "None yet"
+        )
+        best_score = str(self.stats.best_score) if self.stats.games_played else "None yet"
+        if self.stats.games_played:
+            win_rate = round((self.stats.wins / self.stats.games_played) * 100)
+            win_text = f"{self.stats.wins} wins ({win_rate}%)"
+        else:
+            win_text = "No games yet"
+        self.player_stats_var.set(
+            f"Games played: {self.stats.games_played}\n"
+            f"Wins: {win_text}\n"
+            f"Best score: {best_score}\n"
+            f"Fewest pegs: {fewest}"
+        )
+
+    def _maybe_show_tutorial(self) -> None:
+        if not self.stats.tutorial_dismissed:
+            self._show_tutorial(force=False)
+
+    def _show_tutorial(self, force: bool = True) -> None:
+        if self.tutorial_window is not None and self.tutorial_window.winfo_exists():
+            self.tutorial_window.lift()
+            return
+
+        self.tutorial_window = tk.Toplevel(self.root)
+        window = self.tutorial_window
+        window.title("How to Play")
+        window.configure(bg="#111410")
+        window.resizable(False, False)
+        window.transient(self.root)
+        if not force:
+            window.grab_set()
+
+        content = tk.Frame(window, bg="#fff8ea", padx=34, pady=28)
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        tk.Label(
+            content,
+            text="How to Play",
+            bg="#fff8ea",
+            fg="#1d130a",
+            font=("Helvetica", 26, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        tk.Message(
+            content,
+            text=(
+                "Pick one peg to lift out. Then jump a peg over its neighbor "
+                "into an empty hole. The jumped peg leaves the board. Keep "
+                "jumping until the board runs out of legal moves."
+            ),
+            bg="#fff8ea",
+            fg="#21160d",
+            font=("Helvetica", 14),
+            width=470,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        example = tk.Canvas(
+            content,
+            width=470,
+            height=126,
+            bg="#fff8ea",
+            highlightthickness=0,
+            bd=0,
+        )
+        example.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        self._draw_tutorial_example(example)
+
+        tk.Message(
+            content,
+            text=(
+                "Goal: finish with one peg. Getting that last peg back into "
+                "the very first empty hole is the tiny wooden jackpot."
+            ),
+            bg="#fff8ea",
+            fg="#5a2b0e",
+            font=("Helvetica", 13, "bold"),
+            width=470,
+        ).grid(row=3, column=0, sticky="w", pady=(0, 18))
+
+        button_row = tk.Frame(content, bg="#fff8ea")
+        button_row.grid(row=4, column=0, sticky="ew")
+        button_row.columnconfigure(0, weight=1)
+        button_row.columnconfigure(1, weight=1)
+        self._make_button(
+            button_row,
+            text="Start Playing",
+            command=self._close_tutorial,
+            width=220,
+            bg="#fff8ea",
+            fill="#1d130a",
+            hover_fill="#332214",
+            active_fill="#4c321d",
+            text_color="#fff8ea",
+            outline="#d7aa63",
+            height=54,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self._make_button(
+            button_row,
+            text="Do not show again",
+            command=self._dismiss_tutorial,
+            width=220,
+            bg="#fff8ea",
+            fill="#f4d9a9",
+            hover_fill="#ffeecb",
+            active_fill="#e7bd72",
+            text_color="#1d130a",
+            outline="#b5792f",
+            height=54,
+        ).grid(row=0, column=1, sticky="ew", padx=(10, 0))
+
+        self._position_modal(window)
+        self.cursor_manager.register_window(window)
+        window.protocol("WM_DELETE_WINDOW", self._close_tutorial)
+
+    def _draw_tutorial_example(self, canvas: tk.Canvas) -> None:
+        canvas.delete("all")
+        width = 470
+        height = 126
+        canvas.create_rectangle(10, 12, width - 10, height - 12, fill="#d69b55", outline="")
+        canvas.create_rectangle(14, 16, width - 14, height - 16, outline="#7a3c16", width=3)
+        points = [(110, 66), (235, 66), (360, 66)]
+        for x, y in points:
+            canvas.create_oval(x - 25, y - 20, x + 25, y + 25, fill="#261409", outline="#9b5a2c", width=2)
+            canvas.create_oval(x - 17, y - 14, x + 17, y + 19, fill="#120b07", outline="")
+        for x, y in (points[0], points[1]):
+            canvas.create_oval(x - 22, y + 8, x + 22, y + 26, fill="#1d120a", outline="", stipple="gray50")
+            canvas.create_oval(x - 22, y - 22, x + 22, y + 22, fill="#eee8dc", outline="#9b5a2c", width=2)
+            canvas.create_oval(x - 15, y - 15, x + 15, y + 15, fill="#fffaf0", outline="#c3b8a9")
+            canvas.create_oval(x - 7, y - 8, x + 8, y + 8, fill="#ffffff", outline="")
+        canvas.create_line(156, 66, 320, 66, fill="#1d65c9", width=5, arrow=tk.LAST, arrowshape=(14, 18, 7), capstyle=tk.ROUND)
+        canvas.create_text(235, 32, text="jump over", fill="#5a2b0e", font=("Helvetica", 12, "bold"))
+
+    def _dismiss_tutorial(self) -> None:
+        self.stats.tutorial_dismissed = True
+        self._save_stats()
+        self._close_tutorial()
+
+    def _close_tutorial(self) -> None:
+        if self.tutorial_window is None:
+            return
+        if self.tutorial_window.winfo_exists():
+            self.cursor_manager.unregister_window(self.tutorial_window)
+            self.tutorial_window.destroy()
+        self.tutorial_window = None
+
+    def _show_settings(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.cursor_manager.unregister_window(self.settings_window)
+            self.settings_window.destroy()
+            self.settings_window = None
+
+        self.settings_window = tk.Toplevel(self.root)
+        window = self.settings_window
+        window.title("Settings")
+        window.configure(bg="#111410")
+        window.resizable(False, False)
+        window.transient(self.root)
+
+        content = tk.Frame(window, bg="#fff8ea", padx=34, pady=28)
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        tk.Label(
+            content,
+            text="Settings",
+            bg="#fff8ea",
+            fg="#1d130a",
+            font=("Helvetica", 26, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        tk.Message(
+            content,
+            text=(
+                "Tune the table without making the pegs fill out paperwork."
+            ),
+            bg="#fff8ea",
+            fg="#21160d",
+            font=("Helvetica", 14),
+            width=470,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        controls = tk.Frame(content, bg="#fff8ea")
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 18))
+        controls.columnconfigure(0, weight=1)
+        controls.columnconfigure(1, weight=1)
+
+        sound_text = "Sound: On" if self.stats.sound_enabled else "Sound: Off"
+        cursor_text = (
+            "Cursor: Custom"
+            if self.stats.cursor_mode == "auto"
+            else "Cursor: System"
+        )
+        speed_text = f"Speed: {self.stats.animation_speed.title()}"
+
+        self._make_button(
+            controls,
+            text=sound_text,
+            command=self._toggle_sound_setting,
+            width=220,
+            bg="#fff8ea",
+            height=52,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 10), pady=(0, 12))
+        self._make_button(
+            controls,
+            text=speed_text,
+            command=self._cycle_animation_speed,
+            width=220,
+            bg="#fff8ea",
+            height=52,
+        ).grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=(0, 12))
+        self._make_button(
+            controls,
+            text=cursor_text,
+            command=self._toggle_cursor_mode,
+            width=220,
+            bg="#fff8ea",
+            height=52,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 10))
+        self._make_button(
+            controls,
+            text="How to Play",
+            command=lambda: self._show_tutorial(force=True),
+            width=220,
+            bg="#fff8ea",
+            height=52,
+        ).grid(row=1, column=1, sticky="ew", padx=(10, 0))
+
+        tk.Message(
+            content,
+            text=(
+                "Cursor note: Custom mode uses the game pointer where the "
+                "platform allows it. System mode keeps the regular arrow if "
+                "macOS decides to be precious about cursors."
+            ),
+            bg="#fff8ea",
+            fg="#5a2b0e",
+            font=("Helvetica", 12, "bold"),
+            width=470,
+        ).grid(row=3, column=0, sticky="w", pady=(0, 18))
+
+        self._make_button(
+            content,
+            text="Done",
+            command=self._close_settings,
+            width=470,
+            bg="#fff8ea",
+            fill="#1d130a",
+            hover_fill="#332214",
+            active_fill="#4c321d",
+            text_color="#fff8ea",
+            outline="#d7aa63",
+            height=54,
+        ).grid(row=4, column=0, sticky="ew")
+
+        self._position_modal(window)
+        self.cursor_manager.register_window(window)
+        window.protocol("WM_DELETE_WINDOW", self._close_settings)
+
+    def _close_settings(self) -> None:
+        if self.settings_window is None:
+            return
+        if self.settings_window.winfo_exists():
+            self.cursor_manager.unregister_window(self.settings_window)
+            self.settings_window.destroy()
+        self.settings_window = None
+
+    def _toggle_sound_setting(self) -> None:
+        self.stats.sound_enabled = not self.stats.sound_enabled
+        self.sound.enabled = self.stats.sound_enabled
+        self._save_stats()
+        self._show_settings()
+
+    def _cycle_animation_speed(self) -> None:
+        try:
+            current_index = ANIMATION_SPEEDS.index(self.stats.animation_speed)
+        except ValueError:
+            current_index = ANIMATION_SPEEDS.index("normal")
+        self.stats.animation_speed = ANIMATION_SPEEDS[
+            (current_index + 1) % len(ANIMATION_SPEEDS)
+        ]
+        self._save_stats()
+        self._show_settings()
+
+    def _toggle_cursor_mode(self) -> None:
+        self.stats.cursor_mode = (
+            "system" if self.stats.cursor_mode == "auto" else "auto"
+        )
+        self.cursor_manager.set_mode(self.stats.cursor_mode)
+        self._save_stats()
+        self._show_settings()
+
+    def _animation_delay(self, base_ms: int) -> int:
+        multiplier = {
+            "relaxed": 1.35,
+            "normal": 1.0,
+            "quick": 0.65,
+        }.get(self.stats.animation_speed, 1.0)
+        return max(1, round(base_ms * multiplier))
+
+    def _position_modal(self, window: tk.Toplevel) -> None:
+        window.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (
+            window.winfo_width() // 2
+        )
+        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (
+            window.winfo_height() // 2
+        )
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     def new_game(self) -> None:
         self._close_game_over()
@@ -967,6 +1512,8 @@ class PegSolitaireApp:
         self.selected_peg = None
         self.hovered_hole = None
         self.hint_move = None
+        self.session_score = 0
+        self.last_stats_update = None
         self.status_var.set("Pick one white peg to remove and begin.")
         self._update_stats()
         self._draw_board()
@@ -1130,9 +1677,22 @@ class PegSolitaireApp:
         else:
             score = score_board(self.game.pegs, self.game.starting_empty)
             self.session_score += score.points
+            stats_update = record_game(
+                self.stats,
+                rows=self.game.rows,
+                score=score.points,
+                pegs_remaining=self.game.remaining_pegs,
+                is_win=score.is_win,
+            )
+            self.last_stats_update = stats_update
+            self._save_stats()
             self.status_var.set(f"{score.title} {score.message}")
+            if stats_update.has_record:
+                self.status_var.set(
+                    f"{score.title} {score.message} New record, by the way."
+                )
             self.sound.play("game_over")
-            self.root.after(190, lambda: self._show_game_over(score))
+            self.root.after(190, lambda: self._show_game_over(score, stats_update))
 
         self._update_stats()
         self._draw_board()
@@ -1195,7 +1755,7 @@ class PegSolitaireApp:
             return
 
         self.animation_after_id = self.root.after(
-            15,
+            self._animation_delay(15),
             lambda: self._animate_move_step(move, frame + 1),
         )
 
@@ -1229,7 +1789,7 @@ class PegSolitaireApp:
             return
 
         self.animation_after_id = self.root.after(
-            14,
+            self._animation_delay(14),
             lambda: self._animate_starting_lift_step(index, frame + 1),
         )
 
@@ -1274,6 +1834,7 @@ class PegSolitaireApp:
             move_count = self.game.possible_move_count()
             label = "move" if move_count == 1 else "moves"
             self.moves_var.set(f"Moves available: {move_count} {label}")
+        self._refresh_player_stats()
 
     def _draw_board(self) -> None:
         if not hasattr(self, "canvas"):
@@ -1787,7 +2348,11 @@ class PegSolitaireApp:
                 return index
         return None
 
-    def _show_game_over(self, score: ScoreResult) -> None:
+    def _show_game_over(
+        self,
+        score: ScoreResult,
+        stats_update: StatsUpdate | None = None,
+    ) -> None:
         self._close_game_over()
         self.game_over_window = tk.Toplevel(self.root)
         window = self.game_over_window
@@ -1825,12 +2390,37 @@ class PegSolitaireApp:
             width=440,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 20))
 
+        if stats_update is not None and stats_update.has_record:
+            record_text = "New record! The board is pretending to stay humble."
+        elif stats_update is not None and stats_update.is_win:
+            record_text = "A clean win. The pegs are absolutely taking notes."
+        else:
+            record_text = "Another one for the tiny wooden history books."
+        tk.Label(
+            content,
+            text=record_text,
+            bg="#fff8ea",
+            fg="#7a3c16",
+            font=("Helvetica", 14, "bold"),
+            wraplength=440,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
         stats = [
             ("Round points", str(score.points)),
             ("Total score", str(self.session_score)),
             ("Pegs remaining", str(self.game.remaining_pegs)),
             ("Starting hole", str(self.game.starting_empty)),
             ("Moves left", str(self.game.possible_move_count())),
+            ("Games played", str(self.stats.games_played)),
+            ("Wins", str(self.stats.wins)),
+            ("Best score", str(self.stats.best_score)),
+            (
+                "Fewest pegs",
+                str(self.stats.fewest_pegs_remaining)
+                if self.stats.fewest_pegs_remaining is not None
+                else "None yet",
+            ),
         ]
         stats_box = tk.Frame(
             content,
@@ -1840,7 +2430,7 @@ class PegSolitaireApp:
             padx=16,
             pady=12,
         )
-        stats_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 20))
+        stats_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 20))
         stats_box.columnconfigure(0, weight=1)
         for row, (label, value) in enumerate(stats):
             tk.Label(
@@ -1859,7 +2449,7 @@ class PegSolitaireApp:
             ).grid(row=row, column=1, sticky="e", pady=3)
 
         button_row = tk.Frame(content, bg="#fff8ea")
-        button_row.grid(row=4, column=0, columnspan=2, sticky="ew")
+        button_row.grid(row=5, column=0, columnspan=2, sticky="ew")
         button_row.columnconfigure(0, weight=1, minsize=220)
         button_row.columnconfigure(1, weight=1, minsize=220)
         self._make_button(
@@ -1889,14 +2479,7 @@ class PegSolitaireApp:
             height=54,
         ).grid(row=0, column=1, sticky="ew", padx=(10, 0))
 
-        window.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (
-            window.winfo_width() // 2
-        )
-        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (
-            window.winfo_height() // 2
-        )
-        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self._position_modal(window)
         self.cursor_manager.register_window(window)
         window.protocol("WM_DELETE_WINDOW", self._close_game_over)
 

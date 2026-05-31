@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 *'s Peg Solitaire Score.txt
+build/
+dist/
+*.app/
