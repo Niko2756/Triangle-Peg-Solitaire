@@ -11,6 +11,16 @@ the same rule engine can power the console game and the graphical game.
 
 - Playable Tkinter GUI with a wooden board-game panel, blue guide lines, recessed
   holes, and white pegs.
+- Higher-contrast right panel with larger score, peg, move, and status text.
+- Friendlier custom-drawn buttons and a wider right panel so controls do not
+  feel clipped against the window edge.
+- Larger custom row selector with friendly `-` and `+` controls that stay
+  centered inside the sidebar.
+- App-wide image-based custom pointer, peg hover highlights, animated
+  starting-peg lift-out, lifted peg selection, animated peg jumps, and generated
+  sound effects for pickup, lift-out, slot-in, invalid moves, and game over.
+- End-of-game popup summarizes the round result, points, total score, remaining
+  pegs, starting hole, and moves left.
 - Console version still works through the original filename.
 - Row count can be changed from 4 to 10 in the GUI.
 - New Game, Undo, Hint, score, remaining peg count, and available move count.
@@ -56,13 +66,17 @@ python3 -m unittest discover -s tests
 - `peg_solitaire/console.py` contains the text interface, prompts, save files,
   and the polished funny messages.
 - `peg_solitaire/gui.py` contains the desktop interface with a wooden board-game
-  panel, blue guide lines, white pegs, and a dark tabletop backdrop.
+  panel, blue guide lines, white pegs, animation, generated sound effects, and a
+  dark tabletop backdrop.
 - `Triangle Peg solitaire FINAL.py` is kept as a compatibility launcher for the
   original filename.
 - `Triangle Peg Solitaire GUI.py` is a simple launcher for the graphical game.
-- `assets/wood_board.png` is the wood texture used by the GUI board.
+- `assets/wood_board.png` is the photorealistic light maple texture used by the
+  GUI board.
+- `assets/game_cursor.png` is the generated ivory-and-wood pointer used by the
+  custom canvas controls.
 - `tests/test_game.py` covers the core board rules and scoring behavior.
-- `tests/test_gui_assets.py` verifies that the GUI asset is present.
+- `tests/test_gui_assets.py` verifies that the GUI assets are present.
 
 ## Original Inspiration
 
